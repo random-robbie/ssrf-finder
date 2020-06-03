@@ -74,7 +74,7 @@ func main() {
 					newStr := buf.String()
 					if strings.Contains(newStr , "k6unx4pudf8k5itoapaxjwzjigz") == true {
 						color.HiGreen("[*] Vulnerable System Found! [*]\n")
-						f, err := os.OpenFile("/tmp/ssrf.log",
+						f, err := os.OpenFile("ssrf.log",
 							os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 						if err != nil {
 							log.Println(err)
