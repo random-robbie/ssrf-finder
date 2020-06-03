@@ -5,6 +5,12 @@ Pass list of urls with FUZZ in and it will check if it has found a potential SSR
 cat urls.txt | ./ssrf-finder
 ```
 
+or
+
+```
+echo https://www.someting.com/?url=FUZZ&whatever=adsa&id=1  | ./ssrf-finder
+```
+
 if it generates a ssrf.log file then you have some SSRF's if not no SSRF.
 
 URLs must look like.
