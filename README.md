@@ -88,12 +88,15 @@ Suppose you are testing `https://example.com/fetch?url=FUZZ` and you suspect the
 - `[!] no FUZZ placeholder: <url>` — the line does not contain `FUZZ`.
 - `[!] failed: <url> (<error>)` — the request failed (shown in verbose mode).
 - `[*] <url> -> <status>` — request completed (shown in verbose mode).
+- `[*] done: N tested, M vulnerable — results in ssrf.log` — end-of-run summary.
 
 If `ssrf.log` exists when the run finishes, you have potential SSRF findings; if not, none were detected.
 
+Non-200 responses are no longer printed for every URL — pass `-v` if you want to see every request and status.
+
 ## Changelog
 
-- **2026 rewrite** — configurable `-callback` flag (previously a hardcoded Burp Collaborator domain compiled into the source), concurrency/timeout/proxy/user-agent flags, context-aware requests and cancellation, request de-duplication, 1 MiB response cap, startup DNS check of the callback host, updated to Go 1.24. Detection method is unchanged.
+- **2026 rewrite** — configurable `-callback` flag (previously a hardcoded Burp Collaborator domain compiled into the source), concurrency/timeout/proxy/user-agent flags, context-aware requests and cancellation, request de-duplication, 1 MiB response cap, startup DNS check of the callback host, non-200 noise suppressed (pass `-v`), end-of-run summary, unit tests and CI, updated to Go 1.24. Detection method is unchanged.
 - **2019 original** — by @tomnomnom, adapted by @random-robbie.
 
 ## Disclaimer / Authorised use

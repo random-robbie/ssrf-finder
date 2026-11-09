@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,13 +30,13 @@ const (
 
 var (
 	callbackDomain string
-	concurrency    int
-	timeout        time.Duration
-	insecureTLS    bool
-	outputFile     string
+	concurrency    = defaultConcurr
+	timeout        = defaultTimeout
+	insecureTLS    = true
+	outputFile     = defaultOutput
 	proxyURL       string
 	verbose        bool
-	userAgent      string
+	userAgent      = defaultUserAgent
 
 	green  = color.New(color.FgHiGreen, color.Bold)
 	yellow = color.New(color.FgHiYellow)
@@ -99,11 +100,12 @@ func main() {
 
 	urls := make(chan string)
 	var wg sync.WaitGroup
+	var tested, found atomic.Int64
 	wg.Add(concurrency)
 	for range concurrency {
 		go func() {
 			defer wg.Done()
-			worker(ctx, client, cb, urls, out)
+			worker(ctx, client, cb, urls, out, &tested, &found)
 		}()
 	}
 
@@ -129,10 +131,10 @@ func main() {
 	}()
 
 	wg.Wait()
-	cyan.Printf("[*] done, results in %s\n", outputFile)
+	green.Printf("[*] done: %d tested, %d vulnerable — results in %s\n", tested.Load(), found.Load(), outputFile)
 }
 
-func worker(ctx context.Context, client *http.Client, cb *url.URL, urls <-chan string, out *os.File) {
+func worker(ctx context.Context, client *http.Client, cb *url.URL, urls <-chan string, out *os.File, tested, found *atomic.Int64) {
 	for raw := range urls {
 		select {
 		case <-ctx.Done():
@@ -159,6 +161,7 @@ func worker(ctx context.Context, client *http.Client, cb *url.URL, urls <-chan s
 			}
 			continue
 		}
+		tested.Add(1)
 		if verbose {
 			cyan.Fprintf(os.Stderr, "[*] %s -> %s\n", testURL, status)
 		}
@@ -166,6 +169,7 @@ func worker(ctx context.Context, client *http.Client, cb *url.URL, urls <-chan s
 		// Detection: the target application echoes the callback URL back in
 		// its response, proving the server-side request was made.
 		if strings.Contains(body, cb.Hostname()) {
+			found.Add(1)
 			green.Printf("[*] Vulnerable System Found! [*] %s\n", u)
 			if _, err := fmt.Fprintln(out, u.String()); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to write result: %s\n", err)
@@ -209,7 +213,6 @@ func fetch(ctx context.Context, client *http.Client, target string) (string, str
 		return "", "", err
 	}
 	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Connection", "close")
 
 	resp, err := client.Do(req)
 	if err != nil {
