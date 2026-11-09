@@ -1,78 +1,100 @@
 # ssrf-finder
 
-A small Go tool for detecting potential server-side request forgery (SSRF) vulnerabilities. You feed it a list of URLs, each containing the placeholder `FUZZ` where a parameter value goes, and the tool replaces `FUZZ` with a unique callback domain and requests the resulting URL. If the target's response body contains that callback domain, the application is almost certainly fetching your URL — a potential SSRF.
+A small Go tool for detecting potential server-side request forgery (SSRF) vulnerabilities. You feed it a list of URLs, each containing the placeholder `FUZZ` where a parameter value goes, and the tool replaces `FUZZ` with your callback domain and requests the resulting URL. If the target's response body contains that callback domain, the application is almost certainly fetching your URL — a potential SSRF.
+
+Rewritten in 2026: modern Go, configurable callback/concurrency/timeouts, proxy support, graceful Ctrl+C handling and de-duplicated input. The original single-purpose behaviour is preserved — see [Changelog](#changelog).
+
+## Features
+
+- `FUZZ` placeholder substitution — one URL per line, first occurrence only
+- Callback domain supplied by flag, no recompiling needed
+- Configurable concurrency, timeout, user agent and output file
+- HTTP/SOCKS proxy support (point it at Burp to watch every request)
+- Redirects are not followed; response bodies capped at 1 MiB
+- Duplicate input lines are de-duplicated; invalid lines are skipped with a warning
+- Callback host is resolved once at startup so you fail fast on a typo
+- Ctrl+C exits cleanly, keeping any results already written
 
 ## Requirements
 
-- Go (to build from source):
+- Go 1.24 or later to build:
 
   ```
-  go build -o ssrf-finder ssrf-finder.go
+  go build -o ssrf-finder .
   ```
 
-- A callback/collaborator domain. The replacement domain is compiled in as a Burp Collaborator subdomain (`*.burpcollaborator.net`), so it only works as-is if you control that particular Collaborator server. Fork the code and change the `strings.Replace` domain in `fetchURL` to your own Collaborator or listener hostname before using it.
-- URLs must resolve to an IP address (the tool performs a DNS lookup first and skips hosts that do not resolve).
+- A callback host you control — a Burp Collaborator / OAST domain, an interaction server, or any HTTP listener you can see hits on.
+
+## Usage
+
+```
+ssrf-finder -callback http://abc123.oastify.com [flags] [urls.txt]
+```
+
+URLs are read from the file given as the first argument, or from standard input.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-callback` | *(required)* | Callback host used to replace `FUZZ`, e.g. `http://abc123.oastify.com` |
+| `-c` | `10` | Number of concurrent workers |
+| `-timeout` | `5s` | Per-request timeout (Go duration, e.g. `10s`, `1m`) |
+| `-insecure` | `true` | Skip TLS certificate verification |
+| `-output` | `ssrf.log` | File vulnerable URLs are appended to |
+| `-proxy` | *(none)* | HTTP(S) proxy, e.g. `http://127.0.0.1:8080` |
+| `-v` | `false` | Verbose output for every request |
+| `-ua` | recent Chrome | User-Agent header to send |
 
 ## Input format
 
-The tool reads one URL per line from standard input, or from a file given as the first argument. Each URL must be a fully qualified URL containing the literal string `FUZZ`, which marks where the callback domain will be substituted:
+One URL per line, each containing the literal string `FUZZ` where the callback domain should be substituted:
 
 ```
 http://www.something.com/url?=FUZZ&somethingelse=whatever
 ```
 
-`url.ParseRequestURI` validates each line, so malformed URLs are rejected with an `invalid url` message.
-
-Only the first occurrence of `FUZZ` in a URL is replaced. You can generate candidate URLs yourself, for example from a parameter-mining tool, using a pipeline like:
+`url.ParseRequestURI` validates each line, so malformed URLs are rejected with an `invalid url` message. Lines without `FUZZ` are skipped with a warning. You can generate candidate URLs yourself, for example from a parameter-mining tool:
 
 ```
-cat urls.txt | ./ssrf-finder
+cat urls.txt | ./ssrf-finder -callback http://abc123.oastify.com
+echo 'https://www.something.com/?url=FUZZ&whatever=adsa&id=1' | ./ssrf-finder -callback http://abc123.oastify.com
+./ssrf-finder -callback http://abc123.oastify.com urls.txt
 ```
 
-or a single test URL:
+Through Burp Suite, watching every request it makes:
 
 ```
-echo https://www.something.com/?url=FUZZ&whatever=adsa&id=1 | ./ssrf-finder
-```
-
-or from a file:
-
-```
-./ssrf-finder urls.txt
+./ssrf-finder -callback http://abc123.oastify.com -proxy http://127.0.0.1:8080 -c 5 urls.txt
 ```
 
 ## Worked example
 
 Suppose you are testing `https://example.com/fetch?url=FUZZ` and you suspect the application requests the value of the `url` parameter.
 
-1. Point `fetchURL` at your own Collaborator domain (or a listener you control, such as an HTTP server on your VPS).
+1. Start a listener you control and note its hostname (for example `abc123.oastify.com` from Burp Collaborator).
 2. Run the tool:
 
    ```
-   echo 'https://example.com/fetch?url=FUZZ' | ./ssrf-finder
+   echo 'https://example.com/fetch?url=FUZZ' | ./ssrf-finder -callback http://abc123.oastify.com
    ```
 
-3. The tool rewrites the URL to `https://example.com/fetch?url=http://omeg0ivn7k95wloyezah7zcqghm7aw.burpcollaborator.net` and issues a `GET` request with a Chrome user agent, ignoring TLS certificate errors, with a 5-second timeout, at a concurrency of 12.
+3. The tool rewrites the URL to `https://example.com/fetch?url=http://abc123.oastify.com` and issues a `GET` request with a Chrome user agent, ignoring TLS certificate errors, with a 5-second timeout at a concurrency of 10.
 4. Watch your listener. If the target application fetches the URL, you will see an incoming HTTP request on your Collaborator or listener.
-5. Independently of the listener, the tool also checks the target's HTTP response body: if it contains the callback domain, the target is reflecting the fetched content and the URL is logged as vulnerable.
+5. Independently of the listener, the tool also checks the target's HTTP response body: if it contains the callback hostname, the target is reflecting the fetched content and the URL is logged as vulnerable.
 
 ## How results are reported
 
-Progress messages go to standard output as the tool runs:
+- `[*] Vulnerable System Found! [*] <url>` — the response body contained the callback hostname; the original URL (with `FUZZ` still in place) is appended to `ssrf.log`.
+- `[!] invalid url: <line>` — the line failed URL parsing.
+- `[!] no FUZZ placeholder: <url>` — the line does not contain `FUZZ`.
+- `[!] failed: <url> (<error>)` — the request failed (shown in verbose mode).
+- `[*] <url> -> <status>` — request completed (shown in verbose mode).
 
-- `invalid url: <line>` — the line failed URL parsing.
-- `does not resolve: <url>` — the hostname has no DNS record.
-- `failed to fetch: <url> (<error>)` — the request failed.
-- `non-200 response code: <url> (<status>)` — the server replied with a non-200 status.
-- `200 response code: <url> (<status>)` — the server replied with 200.
+If `ssrf.log` exists when the run finishes, you have potential SSRF findings; if not, none were detected.
 
-When the response body contains the callback domain, the tool prints:
+## Changelog
 
-```
-[*] Vulnerable System Found! [*]
-```
-
-and appends the URL to `ssrf.log` in the current directory. If `ssrf.log` exists when the run finishes, you have potential SSRF findings; if not, none were detected.
+- **2026 rewrite** — configurable `-callback` flag (previously a hardcoded Burp Collaborator domain compiled into the source), concurrency/timeout/proxy/user-agent flags, context-aware requests and cancellation, request de-duplication, 1 MiB response cap, startup DNS check of the callback host, updated to Go 1.24. Detection method is unchanged.
+- **2019 original** — by @tomnomnom, adapted by @random-robbie.
 
 ## Disclaimer / Authorised use
 

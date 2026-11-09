@@ -2,139 +2,232 @@ package main
 
 import (
 	"bufio"
-	"bytes"
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"github.com/fatih/color"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/fatih/color"
 )
 
+const (
+	defaultTimeout   = 5 * time.Second
+	defaultConcurr   = 10
+	defaultOutput    = "ssrf.log"
+	defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
+var (
+	callbackDomain string
+	concurrency    int
+	timeout        time.Duration
+	insecureTLS    bool
+	outputFile     string
+	proxyURL       string
+	verbose        bool
+	userAgent      string
+
+	green  = color.New(color.FgHiGreen, color.Bold)
+	yellow = color.New(color.FgHiYellow)
+	cyan   = color.New(color.FgHiCyan)
+)
 
 func main() {
+	flag.StringVar(&callbackDomain, "callback", "", "callback host used to replace FUZZ, e.g. http://abc123.oastify.com (required)")
+	flag.IntVar(&concurrency, "c", defaultConcurr, "number of concurrent workers")
+	flag.DurationVar(&timeout, "timeout", defaultTimeout, "per-request timeout")
+	flag.BoolVar(&insecureTLS, "insecure", true, "skip TLS certificate verification")
+	flag.StringVar(&outputFile, "output", defaultOutput, "file to append vulnerable URLs to")
+	flag.StringVar(&proxyURL, "proxy", "", "HTTP(S) proxy, e.g. http://127.0.0.1:8080")
+	flag.BoolVar(&verbose, "v", false, "verbose output for every request")
+	flag.StringVar(&userAgent, "ua", defaultUserAgent, "User-Agent header to send")
 	flag.Parse()
 
-	var input io.Reader
-	input = os.Stdin
+	if callbackDomain == "" {
+		fmt.Fprintln(os.Stderr, "error: -callback is required, e.g. -callback http://abc123.oastify.com")
+		flag.Usage()
+		os.Exit(1)
+	}
+	if !strings.Contains(callbackDomain, "://") {
+		callbackDomain = "http://" + callbackDomain
+	}
+	cb, err := url.Parse(callbackDomain)
+	if err != nil || cb.Hostname() == "" {
+		fmt.Fprintf(os.Stderr, "error: invalid -callback value: %s\n", callbackDomain)
+		os.Exit(1)
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if !resolves(context.Background(), cb.Hostname()) {
+		fmt.Fprintf(os.Stderr, "error: callback host %s does not resolve, check your -callback value\n", cb.Hostname())
+		os.Exit(1)
+	}
 
+	client := newClient()
+
+	var input io.Reader = os.Stdin
 	if flag.NArg() > 0 {
 		file, err := os.Open(flag.Arg(0))
 		if err != nil {
-			fmt.Printf("failed to open file: %s\n", err)
+			fmt.Fprintf(os.Stderr, "failed to open file: %s\n", err)
 			os.Exit(1)
 		}
+		defer file.Close()
 		input = file
 	}
 
-	sc := bufio.NewScanner(input)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	urls := make(chan string, 128)
-	concurrency := 12
+	out, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open output file: %s\n", err)
+		os.Exit(1)
+	}
+	defer out.Close()
+
+	urls := make(chan string)
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
-
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		go func() {
-			for raw := range urls {
-
-				u, err := url.ParseRequestURI(raw)
-				if err != nil {
-					fmt.Printf("invalid url: %s\n", raw)
-					continue
-				}
-
-				if !resolves(u) {
-					fmt.Printf("does not resolve: %s\n", u)
-					continue
-				}
-
-				resp, err := fetchURL(u)
-				if err != nil {
-					fmt.Printf("failed to fetch: %s (%s)\n", u, err)
-					continue
-				}
-
-
-				if resp.StatusCode != http.StatusOK {
-					fmt.Printf("non-200 response code: %s (%s)\n", u, resp.Status)
-				}
-				if resp.StatusCode == http.StatusOK {
-					fmt.Printf("200 response code: %s (%s)\n", u, resp.Status)
-					buf := new(bytes.Buffer)
-					buf.ReadFrom(resp.Body)
-					newStr := buf.String()
-					if strings.Contains(newStr , "k6unx4pudf8k5itoapaxjwzjigz") == true {
-						color.HiGreen("[*] Vulnerable System Found! [*]\n")
-						f, err := os.OpenFile("ssrf.log",
-							os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-						if err != nil {
-							log.Println(err)
-						}
-						defer f.Close()
-						if _, err := f.WriteString(""+u.String()+"/\n"); err != nil {
-							log.Println(err)
-						}
-
-
-					}
-				}
-			}
-			wg.Done()
+			defer wg.Done()
+			worker(ctx, client, cb, urls, out)
 		}()
 	}
 
-	for sc.Scan() {
-		urls <- sc.Text()
-	}
-	close(urls)
-
-	if sc.Err() != nil {
-		fmt.Printf("error: %s\n", sc.Err())
-	}
+	go func() {
+		sc := bufio.NewScanner(input)
+		seen := make(map[string]bool)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" || seen[line] {
+				continue
+			}
+			seen[line] = true
+			select {
+			case urls <- line:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if err := sc.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "input error: %s\n", err)
+		}
+		close(urls)
+	}()
 
 	wg.Wait()
+	cyan.Printf("[*] done, results in %s\n", outputFile)
 }
 
-func resolves(u *url.URL) bool {
-	addrs, _ := net.LookupHost(u.Hostname())
-	return len(addrs) != 0
+func worker(ctx context.Context, client *http.Client, cb *url.URL, urls <-chan string, out *os.File) {
+	for raw := range urls {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		u, err := url.ParseRequestURI(raw)
+		if err != nil {
+			yellow.Fprintf(os.Stderr, "[!] invalid url: %s\n", raw)
+			continue
+		}
+		if !strings.Contains(u.String(), "FUZZ") {
+			yellow.Fprintf(os.Stderr, "[!] no FUZZ placeholder: %s\n", u)
+			continue
+		}
+
+		testURL := strings.Replace(u.String(), "FUZZ", cb.String(), 1)
+
+		body, status, err := fetch(ctx, client, testURL)
+		if err != nil {
+			if verbose {
+				yellow.Fprintf(os.Stderr, "[!] failed: %s (%s)\n", testURL, err)
+			}
+			continue
+		}
+		if verbose {
+			cyan.Fprintf(os.Stderr, "[*] %s -> %s\n", testURL, status)
+		}
+
+		// Detection: the target application echoes the callback URL back in
+		// its response, proving the server-side request was made.
+		if strings.Contains(body, cb.Hostname()) {
+			green.Printf("[*] Vulnerable System Found! [*] %s\n", u)
+			if _, err := fmt.Fprintln(out, u.String()); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to write result: %s\n", err)
+			}
+		}
+	}
 }
 
-func fetchURL(u *url.URL) (*http.Response, error) {
+func newClient() *http.Client {
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: insecureTLS}, // #nosec G402 - intentional, controlled by -insecure
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: defaultTimeout,
 	}
-	client := http.Client{
+	if proxyURL != "" {
+		pu, err := url.Parse(proxyURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid -proxy value: %s\n", err)
+			os.Exit(1)
+		}
+		tr.Proxy = http.ProxyURL(pu)
+	}
+	return &http.Client{
 		Transport: tr,
-		Timeout:   5 * time.Second,
+		Timeout:   timeout,
+		// The callback endpoint may redirect; do not follow it.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
-	kl := ""+u.String()+""
-	newurl  := strings.Replace(kl, "FUZZ", "http://omeg0ivn7k95wloyezah7zcqghm7aw.burpcollaborator.net",1)
-	req, err := http.NewRequest("GET", newurl, nil)
-	if err != nil {
-		return nil, err
-	}
+}
 
-	req.Close = true
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.163 Safari/537.36")
+func fetch(ctx context.Context, client *http.Client, target string) (string, string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Connection", "close")
+
 	resp, err := client.Do(req)
-
-
-
-
-
 	if err != nil {
-		return nil, err
+		return "", "", err
 	}
+	defer resp.Body.Close()
 
-	return resp, err
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // cap at 1 MiB
+	if err != nil {
+		return "", resp.Status, err
+	}
+	return string(body), resp.Status, nil
+}
+
+func resolves(ctx context.Context, host string) bool {
+	r := &net.Resolver{}
+	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	addrs, err := r.LookupHost(lookupCtx, host)
+	return err == nil && len(addrs) > 0
 }
