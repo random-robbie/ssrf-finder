@@ -42,7 +42,20 @@ URLs are read from the file given as the first argument, or from standard input.
 | `-output` | `ssrf.log` | File vulnerable URLs are appended to |
 | `-proxy` | *(none)* | HTTP(S) proxy, e.g. `http://127.0.0.1:8080` |
 | `-v` | `false` | Verbose output for every request |
-| `-ua` | recent Chrome | User-Agent header to send |
+| `-ua` | current Chrome | User-Agent header to send |
+| `-rotate-ua` | `false` | Rotate the User-Agent per request from a list of current desktop browsers (Chrome, Firefox, Safari, Edge) |
+| `-delay` | `0` | Delay between requests per worker (Go duration, e.g. `500ms`) — useful for rate-limited targets |
+
+## Exit codes
+
+- `0` — run completed, no findings
+- `1` — run completed with one or more vulnerable URLs in the output file
+
+This makes the tool usable in CI and automation pipelines:
+
+```
+./ssrf-finder -callback http://abc123.oastify.com urls.txt || notify-slack.sh
+```
 
 ## Input format
 
@@ -96,7 +109,7 @@ Non-200 responses are no longer printed for every URL — pass `-v` if you want 
 
 ## Changelog
 
-- **2026 rewrite** — configurable `-callback` flag (previously a hardcoded Burp Collaborator domain compiled into the source), concurrency/timeout/proxy/user-agent flags, context-aware requests and cancellation, request de-duplication, 1 MiB response cap, startup DNS check of the callback host, non-200 noise suppressed (pass `-v`), end-of-run summary, unit tests and CI, updated to Go 1.24. Detection method is unchanged.
+- **2026 rewrite** — configurable `-callback` flag (previously a hardcoded Burp Collaborator domain compiled into the source), concurrency/timeout/proxy/user-agent flags, context-aware requests and cancellation, request de-duplication, 1 MiB response cap, startup DNS check of the callback host, non-200 noise suppressed (pass `-v`), end-of-run summary, `-rotate-ua` and `-delay` options, non-zero exit code on findings for pipeline use, unit tests and CI, updated to Go 1.24. Detection method is unchanged.
 - **2019 original** — by @tomnomnom, adapted by @random-robbie.
 
 ## Disclaimer / Authorised use

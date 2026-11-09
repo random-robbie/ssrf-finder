@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -31,8 +32,9 @@ func runWorker(t *testing.T, lines []string) string {
 
 	urls := make(chan string)
 	done := make(chan struct{})
+	picker := &uaPicker{}
 	go func() {
-		worker(context.Background(), newClient(), cbURL, urls, out, &atomic.Int64{}, &atomic.Int64{})
+		worker(context.Background(), newClient(), cbURL, picker, urls, out, &atomic.Int64{}, &atomic.Int64{})
 		close(done)
 	}()
 	for _, l := range lines {
@@ -121,5 +123,44 @@ func TestInvalidAndMissingFuzzLinesSkipped(t *testing.T) {
 	got := runWorker(t, []string{"not-a-url", "http://no-fuzz-here.example/one"})
 	if got != "" {
 		t.Errorf("invalid input should not produce findings, got %q", got)
+	}
+}
+
+func TestUserAgentRotation(t *testing.T) {
+	var mu sync.Mutex
+	agents := make(map[string]bool)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		agents[r.Header.Get("User-Agent")] = true
+		mu.Unlock()
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	// Four distinct requests through one worker with rotation enabled;
+	// the picker cycles through its list, so several UAs must appear.
+	picker := &uaPicker{rotate: true}
+	outPath := filepath.Join(t.TempDir(), "ssrf.log")
+	out, err := os.Create(outPath)
+	if err != nil {
+		t.Fatalf("create output: %s", err)
+	}
+	defer out.Close()
+	cbURL, _ := url.Parse("http://callback.example/oast")
+
+	urls := make(chan string)
+	done := make(chan struct{})
+	go func() {
+		worker(context.Background(), newClient(), cbURL, picker, urls, out, &atomic.Int64{}, &atomic.Int64{})
+		close(done)
+	}()
+	for range 4 {
+		urls <- srv.URL + "/fetch?url=FUZZ"
+	}
+	close(urls)
+	<-done
+
+	if len(agents) < 2 {
+		t.Errorf("expected multiple User-Agents with rotation, got %d: %v", len(agents), agents)
 	}
 }

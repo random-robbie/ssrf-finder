@@ -22,11 +22,39 @@ import (
 )
 
 const (
-	defaultTimeout   = 5 * time.Second
-	defaultConcurr   = 10
-	defaultOutput    = "ssrf.log"
-	defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+	defaultTimeout = 5 * time.Second
+	defaultConcurr = 10
+	defaultOutput  = "ssrf.log"
+
+	// defaultUserAgent: current stable Chrome on Windows. Chrome reports
+	// Windows NT 10.0 even on Windows 11; the minor version is frozen.
+	defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 )
+
+// rotatedUserAgents are used when -rotate-ua is set. Kept to a handful of
+// common, current desktop browsers so requests blend into normal traffic.
+var rotatedUserAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:159.0) Gecko/20100101 Firefox/159.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0",
+}
+
+// uaPicker returns the User-Agent for a request: a fixed one by default, or
+// round-robin over rotatedUserAgents when rotation is enabled.
+type uaPicker struct {
+	rotate bool
+	n      atomic.Uint64
+}
+
+func (p *uaPicker) pick() string {
+	if !p.rotate {
+		return userAgent
+	}
+	i := p.n.Add(1) - 1
+	return rotatedUserAgents[int(i)%len(rotatedUserAgents)]
+}
 
 var (
 	callbackDomain string
@@ -37,6 +65,8 @@ var (
 	proxyURL       string
 	verbose        bool
 	userAgent      = defaultUserAgent
+	rotateUA       bool
+	delay          time.Duration
 
 	green  = color.New(color.FgHiGreen, color.Bold)
 	yellow = color.New(color.FgHiYellow)
@@ -52,6 +82,8 @@ func main() {
 	flag.StringVar(&proxyURL, "proxy", "", "HTTP(S) proxy, e.g. http://127.0.0.1:8080")
 	flag.BoolVar(&verbose, "v", false, "verbose output for every request")
 	flag.StringVar(&userAgent, "ua", defaultUserAgent, "User-Agent header to send")
+	flag.BoolVar(&rotateUA, "rotate-ua", false, "rotate User-Agent per request from a list of current browsers")
+	flag.DurationVar(&delay, "delay", 0, "delay between requests per worker, e.g. 500ms")
 	flag.Parse()
 
 	if callbackDomain == "" {
@@ -96,16 +128,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to open output file: %s\n", err)
 		os.Exit(1)
 	}
-	defer out.Close()
 
 	urls := make(chan string)
 	var wg sync.WaitGroup
 	var tested, found atomic.Int64
+	picker := &uaPicker{rotate: rotateUA}
 	wg.Add(concurrency)
 	for range concurrency {
 		go func() {
 			defer wg.Done()
-			worker(ctx, client, cb, urls, out, &tested, &found)
+			worker(ctx, client, cb, picker, urls, out, &tested, &found)
 		}()
 	}
 
@@ -131,10 +163,15 @@ func main() {
 	}()
 
 	wg.Wait()
+	_ = out.Close() // explicit so the exit code below cannot skip it
 	green.Printf("[*] done: %d tested, %d vulnerable — results in %s\n", tested.Load(), found.Load(), outputFile)
+	if found.Load() > 0 {
+		// Non-zero exit when findings exist, so pipelines can react.
+		os.Exit(1)
+	}
 }
 
-func worker(ctx context.Context, client *http.Client, cb *url.URL, urls <-chan string, out *os.File, tested, found *atomic.Int64) {
+func worker(ctx context.Context, client *http.Client, cb *url.URL, picker *uaPicker, urls <-chan string, out *os.File, tested, found *atomic.Int64) {
 	for raw := range urls {
 		select {
 		case <-ctx.Done():
@@ -154,7 +191,7 @@ func worker(ctx context.Context, client *http.Client, cb *url.URL, urls <-chan s
 
 		testURL := strings.Replace(u.String(), "FUZZ", cb.String(), 1)
 
-		body, status, err := fetch(ctx, client, testURL)
+		body, status, err := fetch(ctx, client, testURL, picker.pick())
 		if err != nil {
 			if verbose {
 				yellow.Fprintf(os.Stderr, "[!] failed: %s (%s)\n", testURL, err)
@@ -173,6 +210,14 @@ func worker(ctx context.Context, client *http.Client, cb *url.URL, urls <-chan s
 			green.Printf("[*] Vulnerable System Found! [*] %s\n", u)
 			if _, err := fmt.Fprintln(out, u.String()); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to write result: %s\n", err)
+			}
+		}
+
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
 			}
 		}
 	}
@@ -204,7 +249,7 @@ func newClient() *http.Client {
 	}
 }
 
-func fetch(ctx context.Context, client *http.Client, target string) (string, string, error) {
+func fetch(ctx context.Context, client *http.Client, target, ua string) (string, string, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -212,7 +257,7 @@ func fetch(ctx context.Context, client *http.Client, target string) (string, str
 	if err != nil {
 		return "", "", err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", ua)
 
 	resp, err := client.Do(req)
 	if err != nil {
